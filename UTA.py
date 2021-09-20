@@ -27,6 +27,7 @@ class UTA:
         self.transformedDf = self.__transofrm(df)
         self.mappingsNames = list(self.transformedDf.columns)
         self.currentRes = None
+        self.currentRes2 = None
         self.n_points = n_points
         self.single_goal = single_goal
 
@@ -77,12 +78,16 @@ class UTA:
 
     def addBetter(self, x, y):
         self.better.append([x, y])
+        self.__model("F")
 
     def getRanking(self):
         return self.__model("F")
 
     def getPrecision(self):
         return self.__model("T")
+    
+    def evaluate(self, mapping, x):
+        return self.__evaluate(mapping, x)
 
     def __evaluate(self, mapping, x):
         result = np.zeros(self.df.shape[0])
@@ -175,6 +180,7 @@ class UTA:
             self.x = linprog(c, a, b, a_eq, b_eq, bounds=bounds, method='revised simplex').x
             return self.__evaluate(mappings, self.x)
         else:
+            a[:,-1] = 0
             result = []
             self.currentRes = []
             am = torch.as_tensor(a)
@@ -199,8 +205,8 @@ class UTA:
             X = walk(z=self.n_probes,
                      ai=am,
                      bi=bm,
-                     # ae=aem,
-                     # be=bem,
+#                      ae=aem,
+#                      be=bem,
                      x_0=x_0,
                      T=1,
                      device=self.device,
@@ -208,10 +214,14 @@ class UTA:
                      seed=44,
                      thinning=15
                      ).numpy()
+            
             for i in range(self.n_probes):
                 if np.isnan(X[i]).any() or (X[i] > 1).any() or (X[i] < -1).any(): continue
                 result.append(self.__evaluate(mappings, X[i]))
             self.currentRes = X
+            self.currentRes2 = result
+            if len(result) < 3:
+                return -9
             return spearmanr(result, axis=1)[0].min()
 
     def __domination(self, x, y):
