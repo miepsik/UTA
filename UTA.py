@@ -3,6 +3,7 @@ import pandas as pd
 from scipy.optimize import linprog
 from scipy.stats import spearmanr
 import matplotlib.pyplot as plt
+from itertools import permutations
 
 from mhar import walk
 import torch
@@ -239,6 +240,19 @@ class UTA:
         result = min(result, self.__model("T"))
         self.better = self.better[:-1]
         return result
+    
+    def __scoreOptions(self, option):
+        for i in range(len(option)-1):
+            self.better.append(option[i], option[i+1])
+        result = self.model("T")
+        self.better = self.better[:-len(option)+1]
+        return result
+    
+    def scoreRanking(self, elements):
+        options = list(permutations(range(len(elements))))
+        np.random.shuffle(options)
+        results = [self.__scoreOption(x) for x in options]
+        return sum(results)/len(results)
 
     def plotUtilityFunctions(self):
         xps, yps = self.__getUtilityFunctions()
