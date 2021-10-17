@@ -11,9 +11,10 @@ import torch
 
 class UTA:
     def __init__(self, df, negative=list(), not_monotonic=list(), device='cpu', n_probes=150, n_points=-1,
-                 single_goal=True):
+                 goal_function='single-diff'):
         assert n_points < 0 or n_points > 1
         assert device in ['cpu', 'cuda']
+        assert goal_function in ['single-diff', 'multi-diff', 'average']
 
         self.df = df
         self.device = device
@@ -23,14 +24,13 @@ class UTA:
         self.mappings = None
         self.mappingsNames = []
         self.x = None
+        self.xx = None
         self.negative = negative
         self.not_monotonic = not_monotonic
         self.transformedDf = self.__transofrm(df)
         self.mappingsNames = list(self.transformedDf.columns)
-        self.currentRes = None
-        self.currentRes2 = None
         self.n_points = n_points
-        self.single_goal = single_goal
+        self.goal_function = goal_function
 
     def __transofrm(self, x):
         result = x.copy()
@@ -87,14 +87,16 @@ class UTA:
     def getPrecision(self):
         return self.__model("T")
     
-    def evaluate(self, mapping, x):
-        return self.__evaluate(mapping, x)
+    def evaluate(self, mapping, x, df=None):
+        return self.__evaluate(mapping, x, df)
 
-    def __evaluate(self, mapping, x):
-        result = np.zeros(self.df.shape[0])
+    def __evaluate(self, mapping, x, df=None):
+        if df is None:
+            df = self.df
+        result = np.zeros(df.shape[0])
         xps, fps = self.__getUtilityFunctions(mapping, x)
-        for i in range(len(self.df.columns)):
-            result += np.interp(self.df[self.df.columns[i]], xps[i], fps[i])
+        for i in range(len(df.columns)):
+            result += np.interp(df[df.columns[i]], xps[i], fps[i])
         return result
 
     def __getMappingVector(self, mapping, x, k):
@@ -155,8 +157,8 @@ class UTA:
                 a[i] += self.__getMappingVector(mappings[j], q, a.shape[1])
         a[:len(self.better), -1] = 1
         i += 1
-        bounds = [(0, 1) for x in c]
-        bounds[-1] = (-1, None)
+        bounds = [(0, 1) for _ in c]
+        bounds[-1] = (0, 10)
 
         for x in mappings:
             k = list(sorted(x.values()))
@@ -179,66 +181,80 @@ class UTA:
             c[-1] = -1
             self.mappings = mappings
             self.x = linprog(c, a, b, a_eq, b_eq, bounds=bounds, method='revised simplex').x
-            return self.__evaluate(mappings, self.x)
-        else:
-            a[:,-1] = 0
-            result = []
-            self.currentRes = []
-            am = torch.as_tensor(a)
-            am = am.type(torch.FloatTensor)
 
-            bm = torch.as_tensor(b.reshape(-1, 1))
-            bm = bm.type(torch.FloatTensor)
+        a[:,-1] = 0
+        result = []
+        self.currentRes = []
+        am = torch.as_tensor(a)
+        am = am.type(torch.FloatTensor)
 
-            aem = torch.as_tensor(a_eq)
-            aem = aem.type(torch.FloatTensor)
+        bm = torch.as_tensor(b.reshape(-1, 1))
+        bm = bm.type(torch.FloatTensor)
 
-            bem = torch.as_tensor(b_eq.reshape(-1, 1))
-            bem = bem.type(torch.FloatTensor)
+        aem = torch.as_tensor(a_eq)
+        aem = aem.type(torch.FloatTensor)
 
-            res = linprog(c, a, b, bounds=bounds, )
-            if res.status > 1:
-                return -99
-            x_0 = res.x
-            x_0[-1] /= 2
-            x_0 = torch.as_tensor(x_0.reshape(-1, 1))
-            x_0 = x_0.type(torch.FloatTensor)
-            X = walk(z=self.n_probes,
-                     ai=am,
-                     bi=bm,
+        bem = torch.as_tensor(b_eq.reshape(-1, 1))
+        bem = bem.type(torch.FloatTensor)
+        
+        bounds[-1] = (0, .000001)
+        res = linprog(c, a, b, bounds=bounds, )
+        if res.status > 1:
+            return -99
+        x_0 = res.x
+        x_0[-1] /= 2
+        x_0 = torch.as_tensor(x_0.reshape(-1, 1))
+        x_0 = x_0.type(torch.FloatTensor)
+        X = walk(z=self.n_probes,
+                 ai=am,
+                 bi=bm,
 #                      ae=aem,
 #                      be=bem,
-                     x_0=x_0,
-                     T=1,
-                     device=self.device,
-                     warm=2,
-                     seed=44,
-                     thinning=15
-                     ).numpy()
-            
-            for i in range(self.n_probes):
-                if np.isnan(X[i]).any() or (X[i] > 1).any() or (X[i] < -1).any(): continue
-                result.append(self.__evaluate(mappings, X[i]))
-            self.currentRes = X
-            self.currentRes2 = result
-            if len(result) < 3:
-                return -9
-            return spearmanr(result, axis=1)[0].min()
+                 x_0=x_0,
+                 T=1,
+                 device=self.device,
+                 warm=2,
+                 seed=44,
+                 thinning=15
+                 ).numpy()
+        for i in range(self.n_probes):
+            if np.isnan(X[i]).any() or (X[i] > 1).any() or (X[i] < -1).any() or X[i].std() < 0.0001: continue
+            q = (self.__evaluate(mappings, X[i]))
+            if q.std() < 0.00001: continue
+            result.append(q)
+
+        if len(result) < 3:
+            return -9
+        if mode == "F":
+            if self.goal_function == "average":
+                self.x = X.mean(0)
+            self.xx = X
+            return self.__evaluate(mappings, self.x)
+
+        return spearmanr(result, axis=1)[0].min()
 
     def __domination(self, x, y):
         used = [x, y]
         used = self.__transofrm(pd.DataFrame(used, columns=self.df.columns))
         return all(used.iloc[0] >= used.iloc[1]) or all(used.iloc[1] >= used.iloc[0])
 
-    def scorePair(self, x, y):
+    def scorePair(self, x, y, scoring='pesimistic'):
+        assert scoring in ['pesimistic', 'mean', 'expected']
+        
         if self.__domination(x, y):
             print("domination")
             return -9
+        result = []
         self.better.append([x, y])
-        result = self.__model("T")
+        result.append(self.__model("T"))
         self.better = self.better[:-1] + [[y, x]]
-        result = min(result, self.__model("T"))
+        result.append(self.__model("T"))
         self.better = self.better[:-1]
+        
+        if scoring == 'pesimistic':
+            return min(result)
+        if scoring == 'mean':
+            return sum(result)/len(result)
         return result
     
     def __scoreOptions(self, option):
