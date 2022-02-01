@@ -11,7 +11,7 @@ import torch
 
 class UTA:
     def __init__(self, df, negative=list(), not_monotonic=list(), device='cpu', n_probes=150, n_points=-1,
-                 goal_function='single-diff'):
+                 goal_function='single-diff', additional_points=None):
         assert n_points < 0 or n_points > 1
         assert device in ['cpu', 'cuda']
         assert goal_function in ['single-diff', 'multi-diff', 'average']
@@ -25,12 +25,14 @@ class UTA:
         self.mappingsNames = []
         self.x = None
         self.xx = None
+        self.rankigs = None
         self.negative = negative
         self.not_monotonic = not_monotonic
         self.transformedDf = self.__transofrm(df)
         self.mappingsNames = list(self.transformedDf.columns)
         self.n_points = n_points
         self.goal_function = goal_function
+        self.additional_points = dict() if additional_points is None else additional_points
 
     def __transofrm(self, x):
         result = x.copy()
@@ -86,7 +88,7 @@ class UTA:
 
     def getPrecision(self):
         return self.__model("T")
-    
+
     def evaluate(self, mapping, x, df=None):
         return self.__evaluate(mapping, x, df)
 
@@ -118,7 +120,7 @@ class UTA:
             break
         return result
 
-    def __model(self, mode="F"):
+    def __model(self, mode="F", ):
         used = []
         for x in self.better:
             used.append(x[0])
@@ -133,7 +135,10 @@ class UTA:
                 valueSet = sorted(used[c].values)
             else:
                 valueSet = np.linspace(self.transformedDf[c].min(), self.transformedDf[c].max(), self.n_points)
-            for q in valueSet:
+                if c in self.additional_points:
+                    for ap in self.additional_points[c]:
+                        valueSet = np.append(valueSet, ap)
+            for q in sorted(valueSet):
                 if q not in tmp:
                     tmp[q] = i
                     i += 1
@@ -160,12 +165,34 @@ class UTA:
         bounds = [(0, 1) for _ in c]
         bounds[-1] = (0, 10)
 
-        for x in mappings:
-            k = list(sorted(x.values()))
+        for x, col in zip(mappings, mappingsNames):
+            k = list(sorted(x.keys()))
             for j in range(len(k) - 1):
-                a[i][k[j]] = 1
-                a[i][k[j + 1]] = -1
-                i += 1
+                done = False
+                if col in self.additional_points:
+                    if j in self.additional_points[col]:
+                        if self.additional_points[col][j] == "right none":
+                            b[i] = 9999
+                            done = True
+                        elif self.additional_points[col][j] == "right inverse":
+                            a[i][x[k[j]]] = -1
+                            a[i][x[k[j + 1]]] = 1
+                            i += 1
+                            done = True
+
+                    if j + 1 in self.additional_points[col]:
+                        if self.additional_points[col][j + 1] == "left none":
+                            b[i] = 9999
+                            done = True
+                        elif self.additional_points[col][j + 1] == "left inverse":
+                            a[i][x[k[j]]] = -1
+                            a[i][x[k[j + 1]]] = 1
+                            i += 1
+                            done = True
+                if not done:
+                    a[i][x[k[j]]] = 1
+                    a[i][x[k[j + 1]]] = -1
+                    i += 1
 
         for k in range(len(c) - 1):
             a[i][k] = -1
@@ -177,12 +204,13 @@ class UTA:
             b[i] = 1
             i += 1
 
-        if mode == "F":
+        if mode == "F" and self.goal_function == "single-diff":
             c[-1] = -1
             self.mappings = mappings
             self.x = linprog(c, a, b, a_eq, b_eq, bounds=bounds, method='revised simplex').x
+            return self.__evaluate(mappings, self.x)
 
-        a[:,-1] = 0
+        a[:, -1] = 0
         result = []
         self.currentRes = []
         am = torch.as_tensor(a)
@@ -196,7 +224,7 @@ class UTA:
 
         bem = torch.as_tensor(b_eq.reshape(-1, 1))
         bem = bem.type(torch.FloatTensor)
-        
+
         bounds[-1] = (0, .000001)
         res = linprog(c, a, b, bounds=bounds, )
         if res.status > 1:
@@ -208,8 +236,8 @@ class UTA:
         X = walk(z=self.n_probes,
                  ai=am,
                  bi=bm,
-#                      ae=aem,
-#                      be=bem,
+                 #                      ae=aem,
+                 #                      be=bem,
                  x_0=x_0,
                  T=1,
                  device=self.device,
@@ -217,30 +245,48 @@ class UTA:
                  seed=44,
                  thinning=15
                  ).numpy()
+        correct = []
         for i in range(self.n_probes):
             if np.isnan(X[i]).any() or (X[i] > 1).any() or (X[i] < -1).any() or X[i].std() < 0.0001: continue
             q = (self.__evaluate(mappings, X[i]))
             if q.std() < 0.00001: continue
+            correct.append(i)
             result.append(q)
+        self.xx = X[correct]
+        self.rankigs = np.array(result)
 
         if len(result) < 3:
             return -9
         if mode == "F":
             if self.goal_function == "average":
+                self.mappings = mappings
                 self.x = X.mean(0)
-            self.xx = X
             return self.__evaluate(mappings, self.x)
 
         return spearmanr(result, axis=1)[0].min()
+
+    def getPWI(self, x, y, rankings=None, xx=None):
+        if rankings is None:
+            rankings = self.rankigs
+        if xx is None:
+            xx = self.xx
+        if isinstance(x, int) and isinstance(y, int):
+            return (rankings[:, x] > rankings[:, y]).mean()
+        else:
+            used = [x, y]
+            used = pd.DataFrame(used, columns=self.df.columns)
+            rankings = np.array([self.evaluate(self.mappings, x, df=used) for x in xx])
+            return (rankings[:, 0] > rankings[:, 1]).mean()
 
     def __domination(self, x, y):
         used = [x, y]
         used = self.__transofrm(pd.DataFrame(used, columns=self.df.columns))
         return all(used.iloc[0] >= used.iloc[1]) or all(used.iloc[1] >= used.iloc[0])
 
-    def scorePair(self, x, y, scoring='pesimistic'):
+    def scorePair(self, x, y, scoring='pesimistic', method='correlation'):
         assert scoring in ['pesimistic', 'mean', 'expected']
-        
+        assert method in ['correlation', 'entropy']
+
         if self.__domination(x, y):
             print("domination")
             return -9
@@ -250,25 +296,32 @@ class UTA:
         self.better = self.better[:-1] + [[y, x]]
         result.append(self.__model("T"))
         self.better = self.better[:-1]
-        
+
         if scoring == 'pesimistic':
             return min(result)
         if scoring == 'mean':
-            return sum(result)/len(result)
+            return sum(result) / len(result)
+        if scoring == 'expected':
+            PWIx = self.getPWI(x, y)
+            PWIy = self.getPWI(y, x)
+            if PWIx == PWIy:
+                return sum(result) / len(result)
+            else:
+                return (result[0] * PWIx + result[1] * PWIy) / (PWIx + PWIy)
         return result
-    
+
     def __scoreOptions(self, option):
-        for i in range(len(option)-1):
-            self.better.append(option[i], option[i+1])
+        for i in range(len(option) - 1):
+            self.better.append(option[i], option[i + 1])
         result = self.model("T")
-        self.better = self.better[:-len(option)+1]
+        self.better = self.better[:-len(option) + 1]
         return result
-    
+
     def scoreRanking(self, elements):
         options = list(permutations(range(len(elements))))
         np.random.shuffle(options)
         results = [self.__scoreOption(x) for x in options]
-        return sum(results)/len(results)
+        return sum(results) / len(results)
 
     def plotUtilityFunctions(self):
         xps, yps = self.__getUtilityFunctions()
