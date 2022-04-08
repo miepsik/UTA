@@ -134,7 +134,10 @@ class UTA:
             if self.n_points < 0:
                 valueSet = sorted(used[c].values)
             else:
-                valueSet = np.linspace(self.transformedDf[c].min(), self.transformedDf[c].max(), self.n_points)
+                if self.transformedDf[c].skew() <= 3:
+                    valueSet = np.linspace(self.transformedDf[c].min(), self.transformedDf[c].max(), self.n_points)
+                elif self.transformedDf[c].skew() > 3:
+                    valueSet = np.exp(np.linspace(np.log(self.transformedDf[c].min()), np.log(self.transformedDf[c].max()), self.n_points))
                 if c in self.additional_points:
                     for ap in self.additional_points[c]:
                         valueSet = np.append(valueSet, ap)
